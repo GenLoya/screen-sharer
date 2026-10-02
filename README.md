@@ -21,6 +21,7 @@ go run ./cmd/sender -addr <receiver-ip>:9000 -display 1 -fps 15 -quality 70
 ```
 
 - `-display` is 1-based (`1` is the first monitor).
+- Start the receiver with `-fullscreen`, or press `F11`, `F` or double-click to toggle fullscreen. `Esc` leaves fullscreen.
 - The sender retries until the receiver is reachable, and exits once the receiver disconnects it.
 
 ## Releases

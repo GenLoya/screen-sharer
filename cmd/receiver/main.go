@@ -2,6 +2,8 @@
 //
 // Only one sender is shown at a time: when a new sender connects, the previous
 // one is disconnected.
+//
+// Press F11, F or double-click to toggle fullscreen; Esc leaves fullscreen.
 package main
 
 import (
@@ -13,15 +15,21 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 
 	"genloya/screen-sharer/internal/protocol"
 )
 
+// doubleClickWindow is the maximum gap between clicks of a double-click.
+const doubleClickWindow = 400 * time.Millisecond
+
 func main() {
 	addr := flag.String("addr", ":9000", "address to listen on for senders")
+	fullscreen := flag.Bool("fullscreen", false, "start in fullscreen mode")
 	flag.Parse()
 
 	ln, err := net.Listen("tcp", *addr)
@@ -36,6 +44,7 @@ func main() {
 	ebiten.SetWindowTitle("Screen Receiver")
 	ebiten.SetWindowSize(1280, 720)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	ebiten.SetFullscreen(*fullscreen)
 	if err := ebiten.RunGame(g); err != nil {
 		log.Fatal(err)
 	}
@@ -48,7 +57,8 @@ type game struct {
 	current net.Conn
 	pending image.Image
 
-	frame *ebiten.Image
+	frame     *ebiten.Image
+	lastClick time.Time
 }
 
 func (g *game) accept(ln net.Listener) {
@@ -115,6 +125,8 @@ func (g *game) drop(conn net.Conn) {
 }
 
 func (g *game) Update() error {
+	g.handleFullscreen()
+
 	g.mu.Lock()
 	img := g.pending
 	g.pending = nil
@@ -129,6 +141,28 @@ func (g *game) Update() error {
 	return nil
 }
 
+// handleFullscreen toggles fullscreen on F11, F or double-click, and leaves it on Esc.
+func (g *game) handleFullscreen() {
+	toggle := inpututil.IsKeyJustPressed(ebiten.KeyF11) || inpututil.IsKeyJustPressed(ebiten.KeyF)
+
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		now := time.Now()
+		if now.Sub(g.lastClick) <= doubleClickWindow {
+			toggle = true
+			g.lastClick = time.Time{}
+		} else {
+			g.lastClick = now
+		}
+	}
+
+	switch {
+	case toggle:
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	case inpututil.IsKeyJustPressed(ebiten.KeyEscape) && ebiten.IsFullscreen():
+		ebiten.SetFullscreen(false)
+	}
+}
+
 func (g *game) Draw(screen *ebiten.Image) {
 	g.mu.Lock()
 	connected := g.current != nil
@@ -138,7 +172,7 @@ func (g *game) Draw(screen *ebiten.Image) {
 		drawFit(screen, g.frame)
 	}
 	if !connected {
-		ebitenutil.DebugPrint(screen, "Waiting for a sender on "+g.addr+"...")
+		ebitenutil.DebugPrint(screen, "Waiting for a sender on "+g.addr+"...\nF11 / double-click: fullscreen")
 	}
 }
 
