@@ -1,17 +1,14 @@
 // Command receiver listens for senders and displays the stream in a window.
 //
 // Only one sender is shown at a time: when a new sender connects, the previous
-// one is disconnected.
+// one is disconnected. The video is decoded by an ffmpeg process per sender.
 //
 // Press F11, F or double-click to toggle fullscreen; Esc leaves fullscreen.
 package main
 
 import (
 	"bufio"
-	"bytes"
 	"flag"
-	"image"
-	"image/jpeg"
 	"log"
 	"net"
 	"sync"
@@ -22,6 +19,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 
 	"genloya/screen-sharer/internal/protocol"
+	"genloya/screen-sharer/internal/video"
 )
 
 // doubleClickWindow is the maximum gap between clicks of a double-click.
@@ -30,7 +28,13 @@ const doubleClickWindow = 400 * time.Millisecond
 func main() {
 	addr := flag.String("addr", ":9000", "address to listen on for senders")
 	fullscreen := flag.Bool("fullscreen", false, "start in fullscreen mode")
+	ffmpegName := flag.String("ffmpeg", "ffmpeg", "ffmpeg executable name or path")
 	flag.Parse()
+
+	ffmpeg, err := video.FindFFmpeg(*ffmpegName)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -38,7 +42,7 @@ func main() {
 	}
 	log.Printf("waiting for senders on %s", ln.Addr())
 
-	g := &game{addr: ln.Addr().String()}
+	g := &game{addr: ln.Addr().String(), ffmpeg: ffmpeg}
 	go g.accept(ln)
 
 	ebiten.SetWindowTitle("Screen Receiver")
@@ -51,13 +55,16 @@ func main() {
 }
 
 type game struct {
-	addr string
+	addr   string
+	ffmpeg string
 
 	mu      sync.Mutex
 	current net.Conn
-	pending image.Image
+	pending *rawFrame
+	cursor  protocol.Cursor
 
 	frame     *ebiten.Image
+	cursorImg *ebiten.Image
 	lastClick time.Time
 }
 
@@ -77,6 +84,7 @@ func (g *game) replace(conn net.Conn) {
 	g.mu.Lock()
 	old := g.current
 	g.current = conn
+	g.cursor = protocol.Cursor{}
 	g.mu.Unlock()
 
 	if old != nil {
@@ -91,26 +99,76 @@ func (g *game) replace(conn net.Conn) {
 func (g *game) serve(conn net.Conn) {
 	defer g.drop(conn)
 
+	var dec *decoder
+	defer func() {
+		if dec != nil {
+			dec.Close()
+		}
+	}()
+
 	r := bufio.NewReader(conn)
 	for {
 		t, payload, err := protocol.ReadMessage(r)
 		if err != nil {
 			return
 		}
-		if t != protocol.MsgFrame {
-			continue
+		switch t {
+		case protocol.MsgHello:
+			if dec != nil {
+				log.Print("duplicate hello from sender")
+				return
+			}
+			hello, err := protocol.DecodeHello(payload)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			start := time.Now()
+			var first sync.Once
+			dec, err = startDecoder(g.ffmpeg, hello, func(f rawFrame) {
+				first.Do(func() { log.Printf("first frame decoded after %s", time.Since(start).Round(time.Millisecond)) })
+				g.setPending(conn, f)
+			})
+			if err != nil {
+				log.Printf("decoder: %v", err)
+				return
+			}
+			log.Printf("receiving %s %dx%d from %s", hello.Codec, hello.Width, hello.Height, conn.RemoteAddr())
+		case protocol.MsgVideo:
+			if dec == nil {
+				continue
+			}
+			if _, err := dec.Write(payload); err != nil {
+				log.Printf("decoder: %v", err)
+				return
+			}
+		case protocol.MsgCursor:
+			c, err := protocol.DecodeCursor(payload)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+			g.mu.Lock()
+			if g.current == conn {
+				g.cursor = c
+			}
+			g.mu.Unlock()
 		}
-		img, err := jpeg.Decode(bytes.NewReader(payload))
-		if err != nil {
-			log.Printf("decode: %v", err)
-			continue
-		}
-		g.mu.Lock()
-		if g.current == conn {
-			g.pending = img
-		}
-		g.mu.Unlock()
 	}
+}
+
+// setPending stores the latest frame from conn, if it is still the active sender.
+func (g *game) setPending(conn net.Conn, f rawFrame) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.current != conn {
+		putFrameBuf(f.pix)
+		return
+	}
+	if g.pending != nil {
+		putFrameBuf(g.pending.pix)
+	}
+	g.pending = &f
 }
 
 func (g *game) drop(conn net.Conn) {
@@ -120,6 +178,7 @@ func (g *game) drop(conn net.Conn) {
 	defer g.mu.Unlock()
 	if g.current == conn {
 		g.current = nil
+		g.cursor = protocol.Cursor{}
 		log.Printf("sender disconnected: %s", conn.RemoteAddr())
 	}
 }
@@ -128,15 +187,19 @@ func (g *game) Update() error {
 	g.handleFullscreen()
 
 	g.mu.Lock()
-	img := g.pending
+	f := g.pending
 	g.pending = nil
 	g.mu.Unlock()
 
-	if img != nil {
-		if g.frame != nil {
-			g.frame.Deallocate()
+	if f != nil {
+		if g.frame == nil || g.frame.Bounds().Dx() != f.width || g.frame.Bounds().Dy() != f.height {
+			if g.frame != nil {
+				g.frame.Deallocate()
+			}
+			g.frame = ebiten.NewImage(f.width, f.height)
 		}
-		g.frame = ebiten.NewImageFromImage(img)
+		g.frame.WritePixels(f.pix)
+		putFrameBuf(f.pix)
 	}
 	return nil
 }
@@ -166,10 +229,24 @@ func (g *game) handleFullscreen() {
 func (g *game) Draw(screen *ebiten.Image) {
 	g.mu.Lock()
 	connected := g.current != nil
+	cursor := g.cursor
 	g.mu.Unlock()
 
 	if g.frame != nil {
-		drawFit(screen, g.frame)
+		fit := fitTransform(screen, g.frame)
+		op := &ebiten.DrawImageOptions{Filter: ebiten.FilterLinear}
+		op.GeoM = fit
+		screen.DrawImage(g.frame, op)
+
+		if connected && cursor.Visible {
+			if g.cursorImg == nil {
+				g.cursorImg = newCursorImage()
+			}
+			x, y := fit.Apply(float64(cursor.X), float64(cursor.Y))
+			op := &ebiten.DrawImageOptions{}
+			op.GeoM.Translate(x, y)
+			screen.DrawImage(g.cursorImg, op)
+		}
 	}
 	if !connected {
 		ebitenutil.DebugPrint(screen, "Waiting for a sender on "+g.addr+"...\nF11 / double-click: fullscreen")
@@ -180,14 +257,14 @@ func (g *game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return outsideWidth, outsideHeight
 }
 
-// drawFit scales src to fit dst while preserving its aspect ratio.
-func drawFit(dst, src *ebiten.Image) {
+// fitTransform scales src to fit dst while preserving its aspect ratio, centered.
+func fitTransform(dst, src *ebiten.Image) ebiten.GeoM {
 	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
 	dw, dh := dst.Bounds().Dx(), dst.Bounds().Dy()
 	scale := min(float64(dw)/float64(sw), float64(dh)/float64(sh))
 
-	op := &ebiten.DrawImageOptions{Filter: ebiten.FilterLinear}
-	op.GeoM.Scale(scale, scale)
-	op.GeoM.Translate((float64(dw)-float64(sw)*scale)/2, (float64(dh)-float64(sh)*scale)/2)
-	dst.DrawImage(src, op)
+	var m ebiten.GeoM
+	m.Scale(scale, scale)
+	m.Translate((float64(dw)-float64(sw)*scale)/2, (float64(dh)-float64(sh)*scale)/2)
+	return m
 }
