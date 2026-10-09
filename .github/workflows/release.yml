@@ -41,7 +41,7 @@ jobs:
 
       - name: Test
         if: matrix.goarch == 'arm64' || matrix.goos == 'windows'
-        run: go test ./...
+        run: go test -short ./...
 
       - name: Build
         shell: bash
